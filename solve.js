@@ -1,7 +1,8 @@
 // csv-reader-speed-01 entry: a fast, dependency-free reimplementation of
 // csv-reader 1.0.0's readCsv. It makes one left-to-right pass over the text,
-// scans the unquoted common path a character at a time, never uses regular
-// expressions, and slices fields out of the original text.
+// finds the unquoted common path's delimiter with indexOf plus cached next CR
+// and LF positions, never uses regular expressions, and slices fields out of
+// the original text.
 //
 // The parsing state lives in module-level variables so the helper functions are
 // ordinary top-level functions (V8 can optimize them once and reuse them across
@@ -41,41 +42,67 @@ let endedCode = END_TEXT;
 let addedCount = 0;
 let errors = [];
 
-// Reads an unquoted field from pos. The common path stops at a comma, LF or CR
-// and slices the run out of the text; a lone CR takes the slow path.
+// Cached next positions of CR and LF at or after pos. Each is found once with
+// indexOf and only ever moves forward as pos does, so the total search cost is
+// linear. -1 means no such character is left after the point it was searched
+// from, so that cache never searches again. run() resets both; the one place
+// pos moves backwards (the unterminated-quote fallback) resets them too.
+let nextCR = -1;
+let nextLF = -1;
+
+// Advances a cache past pos after a scan that skipped over it.
+function syncCrLf() {
+  if (nextCR >= 0 && nextCR < pos) nextCR = text.indexOf('\r', pos);
+  if (nextLF >= 0 && nextLF < pos) nextLF = text.indexOf('\n', pos);
+}
+
+// Finds both cache positions from pos; used on entry and after a rewind.
+function resetCrLf() {
+  nextCR = text.indexOf('\r', pos);
+  nextLF = text.indexOf('\n', pos);
+}
+
+// Reads an unquoted field from pos. The common path finds the earliest of the
+// next comma and the cached next CR/LF, slices the run out of the text, and
+// dispatches on the delimiter; a lone CR takes the slow path.
 function readField() {
   const start = pos;
-  while (pos < len) {
-    const c = text.charCodeAt(pos);
-    if (c === COMMA) break;
-    if (c < 14 && (c === LF || c === CR)) break;
-    pos++;
+  syncCrLf();
+  const comma = text.indexOf(',', start);
+  let end = comma;
+  let atLineEnd = false;
+  if (nextCR >= 0 && (end < 0 || nextCR < end)) end = nextCR;
+  if (nextLF >= 0 && (end < 0 || nextLF < end)) {
+    end = nextLF;
+    atLineEnd = true;
   }
-  if (pos >= len) {
+  if (end < 0) {
+    pos = len;
     endedCode = END_TEXT;
     return text.slice(start, len);
   }
-  const c = text.charCodeAt(pos);
-  if (c === COMMA) {
-    const value = text.slice(start, pos);
-    pos++;
+  if (atLineEnd) {
+    const value = text.slice(start, end);
+    pos = end + 1;
+    line++;
+    endedCode = END_LINE;
+    return value;
+  }
+  if (end === comma) {
+    const value = text.slice(start, end);
+    pos = end + 1;
     endedCode = END_COMMA;
     return value;
   }
-  if (c === LF) {
-    const value = text.slice(start, pos);
-    pos++;
+  // The earliest delimiter is a CR: CRLF ends the line, a lone CR is stray.
+  if (end + 1 < len && text.charCodeAt(end + 1) === LF) {
+    const value = text.slice(start, end);
+    pos = end + 2;
     line++;
     endedCode = END_LINE;
     return value;
   }
-  if (pos + 1 < len && text.charCodeAt(pos + 1) === LF) {
-    const value = text.slice(start, pos);
-    pos += 2;
-    line++;
-    endedCode = END_LINE;
-    return value;
-  }
+  pos = end;
   return readFieldStray(start);
 }
 
@@ -179,48 +206,66 @@ function readQuoted() {
   let runStart = pos;
   let value = null; // null until the first escape or inner line break
   let closed = false;
-  while (pos < len) {
-    const c = text.charCodeAt(pos);
-    if (c === QUOTE) {
-      if (pos + 1 < len && text.charCodeAt(pos + 1) === QUOTE) {
-        if (value === null) value = text.slice(contentStart, pos) + '"';
-        else value += text.slice(runStart, pos) + '"';
-        pos += 2;
+
+  // Fast path: the field's next quote is its closing quote, no CR or LF comes
+  // before it, and it is not the first quote of a doubled quote. The whole
+  // value is then one slice of the original text.
+  syncCrLf();
+  const close = text.indexOf('"', pos);
+  if (
+    close >= 0 &&
+    (nextCR < 0 || nextCR >= close) &&
+    (nextLF < 0 || nextLF >= close) &&
+    !(close + 1 < len && text.charCodeAt(close + 1) === QUOTE)
+  ) {
+    value = text.slice(pos, close);
+    pos = close + 1;
+    closed = true;
+  } else {
+    while (pos < len) {
+      const c = text.charCodeAt(pos);
+      if (c === QUOTE) {
+        if (pos + 1 < len && text.charCodeAt(pos + 1) === QUOTE) {
+          if (value === null) value = text.slice(contentStart, pos) + '"';
+          else value += text.slice(runStart, pos) + '"';
+          pos += 2;
+          runStart = pos;
+          continue;
+        }
+        if (value === null) value = text.slice(contentStart, pos);
+        else value += text.slice(runStart, pos);
+        pos++;
+        closed = true;
+        break;
+      }
+      if (c === CR) {
+        // CRLF and a lone CR inside quotes are each one LF.
+        const seg = text.slice(runStart, pos);
+        if (value === null) value = seg + '\n';
+        else value += seg + '\n';
+        line++;
+        pos += pos + 1 < len && text.charCodeAt(pos + 1) === LF ? 2 : 1;
         runStart = pos;
         continue;
       }
-      if (value === null) value = text.slice(contentStart, pos);
-      else value += text.slice(runStart, pos);
+      if (c === LF) {
+        const seg = text.slice(runStart, pos);
+        if (value === null) value = seg + '\n';
+        else value += seg + '\n';
+        line++;
+        pos++;
+        runStart = pos;
+        continue;
+      }
       pos++;
-      closed = true;
-      break;
     }
-    if (c === CR) {
-      // CRLF and a lone CR inside quotes are each one LF.
-      const seg = text.slice(runStart, pos);
-      if (value === null) value = seg + '\n';
-      else value += seg + '\n';
-      line++;
-      pos += pos + 1 < len && text.charCodeAt(pos + 1) === LF ? 2 : 1;
-      runStart = pos;
-      continue;
-    }
-    if (c === LF) {
-      const seg = text.slice(runStart, pos);
-      if (value === null) value = seg + '\n';
-      else value += seg + '\n';
-      line++;
-      pos++;
-      runStart = pos;
-      continue;
-    }
-    pos++;
   }
   if (!closed) {
     // The quote never closes: it is a literal character, and the text after it
     // is read again as unquoted, starting just after the opening quote.
     pos = open + 1;
     line = openLine;
+    resetCrLf();
     errors.push({ code: 'unterminated_quote', line: recordLine, row: recordRow });
     return readAppend('"', false);
   }
@@ -270,6 +315,7 @@ export function run(input) {
   pos = 0;
   line = 1;
   if (len > 0 && text.charCodeAt(0) === BOM) pos = 1;
+  resetCrLf();
   recordLine = 1;
   recordRow = null;
   endedCode = END_TEXT;
